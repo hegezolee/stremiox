@@ -1,0 +1,31 @@
+name: Personal iPhone and iPad build
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - 'app/**'
+      - 'core/**'
+      - 'scripts/**'
+      - '.github/workflows/personal-ios.yml'
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: macos-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install XcodeGen
+        run: brew install xcodegen
+      - name: Show Xcode
+        run: xcodebuild -version
+      - name: Build personal unsigned IPA
+        run: ./scripts/build-personal-ios.sh ipa
+      - uses: actions/upload-artifact@v4
+        with:
+          name: StremioPersonal-unsigned
+          path: |
+            build/personal-ios/StremioPersonal-unsigned.ipa
+            build/personal-ios/SHA256SUMS.txt
+          if-no-files-found: error
+          retention-days: 14
