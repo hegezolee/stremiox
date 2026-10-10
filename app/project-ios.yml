@@ -1,0 +1,63 @@
+# Personal iPhone/iPad build; upstream targets remain in project.yml.
+name: StremioPersonal
+options:
+  bundleIdPrefix: com.stremiox
+  deploymentTarget:
+    iOS: '16.0'
+  createIntermediateGroups: true
+packages:
+  MPVKit:
+    url: https://github.com/mpvkit/MPVKit
+    exactVersion: 0.41.0
+targets:
+  StremioPersonal:
+    type: application
+    platform: iOS
+    sources:
+    - SourcesiOS
+    - SourcesShared
+    - Sources/Player
+    - Sources/NodeServer.swift
+    - Sources/PlayerScreen.swift
+    - Sources/ShareSheet.swift
+    - Sources/ExternalPlayer.swift
+    - Resources/Assets.xcassets
+    - path: Resources/server.js
+      buildPhase: resources
+    - path: Resources/fonts
+      optional: true
+      type: folder
+      buildPhase: resources
+    dependencies:
+    - package: MPVKit
+      product: MPVKit-GPL
+    - framework: Vendor/nodejs-mobile/NodeMobile.xcframework
+      embed: true
+      codeSign: true
+    - framework: Vendor/StremioXCore.xcframework
+      embed: false
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.hegezolee.stremiopersonal
+        SWIFT_OBJC_BRIDGING_HEADER: Sources/Player/StremioX-Bridging.h
+        MARKETING_VERSION: 0.3.0
+        CURRENT_PROJECT_VERSION: '97'
+        TARGETED_DEVICE_FAMILY: 1,2
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+        GENERATE_INFOPLIST_FILE: 'YES'
+        INFOPLIST_FILE: Resources/Info-iOS.plist
+        INFOPLIST_KEY_CFBundleDisplayName: Stremio Personal
+        INFOPLIST_KEY_UILaunchScreen_Generation: 'YES'
+        INFOPLIST_KEY_UIApplicationSceneManifest_Generation: 'YES'
+        INFOPLIST_KEY_UIStatusBarStyle: UIStatusBarStyleLightContent
+        CODE_SIGNING_ALLOWED: 'YES'
+        CODE_SIGNING_REQUIRED: 'NO'
+schemes:
+  StremioPersonal:
+    build:
+      targets:
+        StremioPersonal: all
+    run:
+      config: Debug
+    archive:
+      config: Release
