@@ -125,8 +125,32 @@ final class MPVMetalViewController: PlatformViewController {
 
         // libmpv sets the video output up for whatever size it STARTS at but doesn't refill the
         // surface after a live resize (the video ends up tiny in a corner after rotating). Rebuild
-        // the video output (vid no → auto) at the new size.
-        if didResize { reconfigureVideoOutput() }
+        // the video output (vid no → auto) at the new size — debounced, see scheduleVideoOutputRebuild.
+        if videoOutputSize == .zero { videoOutputSize = size }
+        if didResize { scheduleVideoOutputRebuild() }
+    }
+
+    /// The drawable size the current video output was built for.
+    private var videoOutputSize: CGSize = .zero
+    private var rebuildWorkItem: DispatchWorkItem?
+
+    /// Coalesce a burst of layout changes (rotation, fullscreen toggle, cover presentation) into ONE
+    /// video-output rebuild once the size has settled, and skip it if the size ends up where the
+    /// output was built. Every rebuild destroys the MoltenVK swapchain while frames are in flight,
+    /// and that teardown races a Metal completion handler (MVKCommandEncoder::finishQueries) into a
+    /// use-after-free — the intermittent EXC_BAD_ACCESS when starting / resuming playback. Fewer
+    /// teardowns = far fewer chances to lose that race.
+    private func scheduleVideoOutputRebuild() {
+        rebuildWorkItem?.cancel()
+        let work = DispatchWorkItem { [weak self] in
+            guard let self, self.mpv != nil else { return }
+            let size = self.view.bounds.size
+            guard size != self.videoOutputSize else { return }
+            self.videoOutputSize = size
+            self.reconfigureVideoOutput()
+        }
+        rebuildWorkItem = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.35, execute: work)
     }
 
     private func reconfigureVideoOutput() {
@@ -439,6 +463,7 @@ final class MPVMetalViewController: PlatformViewController {
     /// destruction is serialized onto the event queue so it can't race `readEvents`.
     func stop() {
         NotificationCenter.default.removeObserver(self)
+        rebuildWorkItem?.cancel(); rebuildWorkItem = nil
 #if os(tvOS)
         // Hand the TV back its default display mode; the view can already be
         // detached here, so HDRDisplayMode falls back to the app's window.
@@ -647,6 +672,7 @@ final class MPVMetalViewController: PlatformViewController {
     }
     
     private func getFlag(_ name: String) -> Bool {
+        guard mpv != nil else { return false }
         var data = Int64()
         mpv_get_property(mpv, name, MPV_FORMAT_FLAG, &data)
         return data > 0

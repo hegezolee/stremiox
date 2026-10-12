@@ -153,7 +153,11 @@ struct iOSDetailView: View {
                 }
             }
         }
-        .onDisappear { core.unloadMeta(); torrentPrime?.cancel() }
+        // No unloadMeta here (tvOS parity): onDisappear also fires when an episode page is PUSHED on top
+        // (after the episode's onAppear), so unloading wiped the episode's stream request the moment it
+        // was made — why series never found sources while movies did. Loading another title replaces
+        // the state anyway, and the `meta` id guard keeps a stale title from rendering.
+        .onDisappear { torrentPrime?.cancel() }
         // Flip the spinner to "No sources found" if resolution hangs past 12s (mirrors iOSEpisodeStreams).
         .task {
             try? await Task.sleep(for: .seconds(12))
@@ -169,11 +173,9 @@ struct iOSDetailView: View {
                     onSeek: { pos, dur in Task { [weak account] in await account?.saveProgress(for: launch.meta, positionSeconds: pos, durationSeconds: dur) } },
                     onClose: { presentation = nil }
                 )
-                .ignoresSafeArea()
             case .trailerPlayer(let url, let title):
                 PlayerScreen(url: url, title: title, headers: nil, resumeSeconds: 0,
                              recordMeta: nil, onClose: { presentation = nil })
-                    .ignoresSafeArea()
             }
         }
     }
@@ -248,19 +250,21 @@ struct iOSDetailView: View {
     /// Full-bleed artwork with the same two scrims tvOS uses: a vertical canvas fade so the lower text
     /// block stays readable, and a leading canvas fade for the title column.
     private var backdrop: some View {
-        AsyncImage(url: URL(string: meta?.background ?? meta?.poster ?? "")) { phase in
-            switch phase {
-            case .success(let img): img.resizable().aspectRatio(contentMode: .fill)
-            default: Theme.Palette.surface1
+        // The placeholder colour is the backdrop's WIDTH ANCHOR: it takes exactly the proposed viewport
+        // width. The artwork lives in an overlay so its aspect-FILL size (e.g. 569pt wide for a 16:9
+        // image at 320pt tall) can never be reported up — before, the filled image widened the ZStack
+        // and the whole scroll column past the screen, clipping the hero, seasons and episodes.
+        Theme.Palette.surface1
+            .frame(height: backdropHeight)
+            .frame(maxWidth: .infinity)
+            .overlay {
+                AsyncImage(url: URL(string: meta?.background ?? meta?.poster ?? "")) { phase in
+                    if case .success(let img) = phase {
+                        img.resizable().aspectRatio(contentMode: .fill)
+                    }
+                }
             }
-        }
-        .frame(height: backdropHeight)
-        // The backdrop is the ZStack's WIDTH ANCHOR: it greedily takes the full viewport width and
-        // pins to the leading edge, so the ZStack's leading edge is the screen's leading edge. Before
-        // this, the oversized serif hero title made the ZStack wider than the screen and `.bottomLeading`
-        // pushed the whole block to a negative x — clipping the title / Watch / synopsis off the left.
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .clipped()
+            .clipped()
         .overlay(
             LinearGradient(stops: [
                 .init(color: .clear, location: 0.0),
@@ -345,32 +349,47 @@ struct iOSDetailView: View {
     /// of the tvOS series hero. Tapping it pushes that episode's source list (the same screen an
     /// episode-row tap opens), so the user still picks the source.
     @ViewBuilder private var seriesHeroActions: some View {
-        let primary = meta?.videos.flatMap { seriesPrimaryEpisode($0) }
-        let primaryProgress = primary.map { episodeProgress($0.video) } ?? 0
-        VStack(alignment: .leading, spacing: Theme.Space.xs) {
+        // One row when it fits; otherwise the chips wrap under the primary button (like the movie
+        // row). A single unbreakable row is wider than a phone, which widened the whole detail column
+        // past the viewport and shoved the hero, seasons and episodes off the left edge.
+        ViewThatFits(in: .horizontal) {
             HStack(spacing: Theme.Space.sm) {
-                if let m = meta, let primary {
-                    VStack(alignment: .leading, spacing: Theme.Space.xs) {
-                        NavigationLink {
-                            iOSEpisodeStreams(meta: m, video: primary.video, season: primary.video.season ?? 1)
-                        } label: {
-                            Label(primaryEpisodeLabel(primary.video, isResume: primary.isResume),
-                                  systemImage: "play.fill")
-                        }
-                        .buttonStyle(PrimaryActionStyle())
-                        if primary.isResume, primaryProgress > 0.01 {
-                            iOSProgressStripe(value: primaryProgress)
-                                .frame(width: 160)
-                        }
-                    }
-                    .fixedSize(horizontal: true, vertical: false)
-                }
+                seriesPrimaryButton
                 trailerButton
                 iOSLibraryChip()
                 Spacer(minLength: 0)
             }
+            VStack(alignment: .leading, spacing: Theme.Space.sm) {
+                seriesPrimaryButton
+                HStack(spacing: Theme.Space.sm) {
+                    trailerButton
+                    iOSLibraryChip()
+                    Spacer(minLength: 0)
+                }
+            }
         }
         .padding(.top, Theme.Space.xs)
+    }
+
+    /// The series hero's Resume/Play button, with a progress stripe for a partially watched episode.
+    @ViewBuilder private var seriesPrimaryButton: some View {
+        if let m = meta, let primary = m.videos.flatMap({ seriesPrimaryEpisode($0) }) {
+            let primaryProgress = episodeProgress(primary.video)
+            VStack(alignment: .leading, spacing: Theme.Space.xs) {
+                NavigationLink {
+                    iOSEpisodeStreams(meta: m, video: primary.video, season: primary.video.season ?? 1)
+                } label: {
+                    Label(primaryEpisodeLabel(primary.video, isResume: primary.isResume),
+                          systemImage: "play.fill")
+                }
+                .buttonStyle(PrimaryActionStyle())
+                if primary.isResume, primaryProgress > 0.01 {
+                    iOSProgressStripe(value: primaryProgress)
+                        .frame(width: 160)
+                }
+            }
+            .fixedSize(horizontal: true, vertical: false)
+        }
     }
 
     /// Resume position (the saved episode, if not yet watched) vs the first unwatched episode,
@@ -951,7 +970,6 @@ struct iOSEpisodeStreams: View {
                 onSeek: { pos, dur in Task { [weak account] in await account?.saveProgress(for: launch.meta, positionSeconds: pos, durationSeconds: dur) } },
                 onClose: { player = nil }
             )
-            .ignoresSafeArea()
         }
     }
 
@@ -991,16 +1009,19 @@ struct iOSEpisodeStreams: View {
     }
 
     private var backdrop: some View {
-        AsyncImage(url: URL(string: video.thumbnail ?? meta.background ?? meta.poster ?? "")) { phase in
-            switch phase {
-            case .success(let img): img.resizable().aspectRatio(contentMode: .fill)
-            default: Theme.Palette.surface1
+        // Width anchor for the episode hero ZStack: the placeholder sizes it, the artwork is an overlay
+        // so its aspect-fill width can't widen the column (see iOSDetailView.backdrop).
+        Theme.Palette.surface1
+            .frame(height: backdropHeight)
+            .frame(maxWidth: .infinity)
+            .overlay {
+                AsyncImage(url: URL(string: video.thumbnail ?? meta.background ?? meta.poster ?? "")) { phase in
+                    if case .success(let img) = phase {
+                        img.resizable().aspectRatio(contentMode: .fill)
+                    }
+                }
             }
-        }
-        .frame(height: backdropHeight)
-        // Width anchor for the episode hero ZStack — full viewport width, pinned leading (see iOSDetailView.backdrop).
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .clipped()
+            .clipped()
         .overlay(
             LinearGradient(stops: [
                 .init(color: .clear, location: 0.0),

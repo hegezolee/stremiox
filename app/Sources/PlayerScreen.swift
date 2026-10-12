@@ -33,6 +33,7 @@ struct PlayerScreen: View {
     @EnvironmentObject private var core: CoreBridge
     @EnvironmentObject private var account: StremioAccount
     @EnvironmentObject private var theme: ThemeManager      // observe accent + textScale so the chrome repaints live
+    @Environment(\.accessibilityVoiceOverEnabled) private var voiceOverEnabled   // keep the controls up for VoiceOver (#31)
 
     /// Whether the CURRENTLY playing stream is a Live stream (tv / channel / events): live engages
     /// libmpv's live-tuned read-ahead/reconnect, shows a "LIVE" indicator in place of the scrubber, and
@@ -106,6 +107,7 @@ struct PlayerScreen: View {
     @State private var isHDR = false
     @State private var metadataLine = ""        // "4K · HDR · EAC3"-style line shown under the title
     @State private var controlsVisible = true
+    @State private var controlsShownAt = Date.distantPast   // when a tap last revealed the controls
     @State private var scrubbing = false
     @State private var scrubTarget: Double = 0   // committed scrub position while dragging; avoids timePos fighting the thumb (#32)
     @State private var refreshTask: Task<Void, Never>?   // debounced panel/track refresh; cancellable so it can't outlive the player (#20)
@@ -199,10 +201,11 @@ struct PlayerScreen: View {
             // Skip pill shows only while watching (controls hidden), mirroring tvOS.
             if let seg = currentSkip, !controlsVisible, panel == nil, !loadFailed { skipPill(seg) }
 
-            // Render controls UNCONDITIONALLY (just faded/non-interactive when hidden) so VoiceOver can
-            // still reach them when auto-hidden — otherwise a hidden bar drops out of the a11y tree (#31).
-            if !loadFailed {
-                controls.opacity(controlsVisible ? 1 : 0).allowsHitTesting(controlsVisible)
+            // Insert / remove the controls rather than fading them: Liquid Glass doesn't render a parent
+            // opacity change reliably, so a faded-out bar stayed drawn while ignoring every tap.
+            // VoiceOver users keep the bar up instead (scheduleHide never hides it for them, #31).
+            if !loadFailed, controlsVisible {
+                controls.transition(.opacity)
             }
 
             if let panel { selectionSheet(panel) }
@@ -212,16 +215,14 @@ struct PlayerScreen: View {
             // Always-present escape hatch until the first frame arrives: a top-most close button so the
             // player is NEVER a trap, even with controls auto-hidden and the spinner covering the
             // tap-to-restore layer. macOS has no Esc/▶︎ remote fallback, so this is the only reliable
-            // way out of a stuck load. Disappears once playback starts (the normal controls take over).
-            if !hasStartedPlaying {
+            // way out of a stuck load. Disappears once playback starts (the normal controls take over),
+            // and while the controls are up, whose own close button sits in the same spot.
+            if !hasStartedPlaying, !controlsVisible {
                 VStack {
                     HStack {
-                        Button { leavePlayback() } label: {
-                            Image(systemName: "xmark")
-                                .font(.system(size: 17, weight: .bold)).foregroundStyle(.white)
-                                .padding(12).background(.black.opacity(0.55), in: Circle())
-                        }
-                        .buttonStyle(.plain)
+                        Button { leavePlayback() } label: { glassIcon("xmark") }
+                        .buttonStyle(.glass)
+                        .buttonBorderShape(.circle)
                         .keyboardShortcut(.cancelAction)   // ⌘. / Esc on macOS
                         .accessibilityLabel("Close player")
                         Spacer()
@@ -247,6 +248,7 @@ struct PlayerScreen: View {
         .persistentSystemOverlays(.hidden)
         #endif
         .tint(Theme.Palette.accent)
+        .environment(\.colorScheme, .dark)   // glass chrome + menus always render dark over video
         .onAppear {
             curURL = url; curHeaders = headers; curIsTorrent = recordIsTorrent
             scheduleHide(); startLoadTimeout()
@@ -314,6 +316,7 @@ struct PlayerScreen: View {
                     startStallWatchdog()            // arm mid-playback freeze detection
                     fetchSkipTimestamps()           // crowd intro/outro spans (disk-cached, non-blocking)
                     fetchAddonSubtitles()
+                    if panel == nil { scheduleHide() }   // the pre-start timer bailed; arm auto-hide now
                 }
                 if !scrubbing {
                     currentTime = d
@@ -708,7 +711,13 @@ struct PlayerScreen: View {
 
     private var bufferingOverlay: some View {
         VStack(spacing: 14) {
-            ProgressView().controlSize(.large).tint(.white)
+            // With the controls up, the play/pause button shows the spinner itself; the status line
+            // drops below the transport so it never collides with it.
+            if controlsVisible {
+                Color.clear.frame(height: 150)
+            } else {
+                ProgressView().controlSize(.large).tint(.white)
+            }
             if let status = torrentStatus {   // live peer/byte progress during torrent warm-up
                 Text(status).font(.callout.weight(.medium)).foregroundStyle(.white.opacity(0.9))
             } else if reconnecting {
@@ -727,14 +736,19 @@ struct PlayerScreen: View {
                     .font(.title3.weight(.semibold)).foregroundStyle(.white)
                 Text(loadErrorHint).font(.callout).foregroundStyle(.white.opacity(0.75))
                     .multilineTextAlignment(.center).frame(maxWidth: 480).fixedSize(horizontal: false, vertical: true)
-                HStack(spacing: 16) {
-                    if hasAlternateSources {
-                        Button { openPanel(.sources) } label: { Label("Other sources", systemImage: "rectangle.stack").padding(6) }
+                GlassEffectContainer(spacing: 16) {
+                    HStack(spacing: 16) {
+                        Button { leavePlayback() } label: { Label("Back", systemImage: "chevron.left").padding(6) }
+                            .buttonStyle(.glass)
+                        if hasAlternateSources {
+                            Button { openPanel(.sources) } label: { Label("Other Sources", systemImage: "rectangle.stack").padding(6) }
+                                .buttonStyle(.glass)
+                        }
+                        Button { retryLoad() } label: { Label("Retry", systemImage: "arrow.clockwise").padding(6) }
+                            .buttonStyle(.glassProminent).tint(Theme.Palette.accent)
                     }
-                    Button { retryLoad() } label: { Label("Retry", systemImage: "arrow.clockwise").padding(6) }
-                    Button { leavePlayback() } label: { Label("Back", systemImage: "chevron.left").padding(6) }
                 }
-                .buttonStyle(.borderedProminent).tint(Theme.Palette.accent).foregroundStyle(.white).padding(.top, 6)
+                .padding(.top, 6)
             }
             .padding(40)
         }
@@ -750,7 +764,7 @@ struct PlayerScreen: View {
 
     private var controls: some View {
         ZStack {
-            LinearGradient(colors: [.black.opacity(0.55), .clear, .black.opacity(0.75)],
+            LinearGradient(colors: [.black.opacity(0.7), .clear, .black.opacity(0.75)],
                            startPoint: .top, endPoint: .bottom)
                 .ignoresSafeArea().allowsHitTesting(false)
 
@@ -809,54 +823,57 @@ struct PlayerScreen: View {
                 }
             }
             Spacer()
-            if hasNext {
-                iconButton("forward.end.fill", label: "Next episode") {
-                    if duration > 0 { onProgress(currentTime, duration) }   // flush before advancing
-                    onNext()
+            GlassEffectContainer(spacing: 12) {
+                HStack(spacing: 12) {
+                    if hasNext {
+                        iconButton("forward.end.fill", label: "Next episode") {
+                            if duration > 0 { onProgress(currentTime, duration) }   // flush before advancing
+                            onNext()
+                        }
+                    }
+                    #if os(iOS)
+                    // Manual landscape lock is an iOS-only affordance (macOS windows don't rotate).
+                    iconButton(forcedLandscape ? "arrow.down.right.and.arrow.up.left"
+                                               : "arrow.up.left.and.arrow.down.right",
+                               label: forcedLandscape ? "Exit fullscreen" : "Fullscreen") {
+                        forcedLandscape.toggle()
+                        coordinator.player?.setOrientation(landscape: forcedLandscape)
+                        scheduleHide()
+                    }
+                    #endif
+                    iconButton("gearshape", label: "Player settings") { openPanel(.playerSettings) }   // restart, hand-off, decoder, info
                 }
-            }
-            #if os(iOS)
-            // Manual landscape lock is an iOS-only affordance (macOS windows don't rotate).
-            iconButton(forcedLandscape ? "arrow.down.right.and.arrow.up.left"
-                                       : "arrow.up.left.and.arrow.down.right", label: "Toggle fullscreen") {
-                forcedLandscape.toggle()
-                coordinator.player?.setOrientation(landscape: forcedLandscape)
-                scheduleHide()
-            }
-            #endif
-            if !isLive {
-                // Restart from 0:00 (tvOS parity #5): seek to the start and keep playing.
-                iconButton("arrow.counterclockwise", label: "Restart") {
-                    coordinator.player?.seek(to: 0)
-                    currentTime = 0
-                    if duration > 0 { onSeek(0, duration); lastReported = 0 }
-                    if isPaused { coordinator.player?.togglePause() }   // restart implies resume
-                    scheduleHide()
-                }
-            }
-            iconButton("gearshape", label: "Player settings") { openPanel(.playerSettings) }   // decoder toggle + playback info (tvOS parity #22)
-            iconButton("arrow.up.forward.app", label: "Play in another app") {       // hand off to Infuse / VLC / Share
-                hideTask?.cancel()
-                showExternalChooser = true
             }
         }
         .padding(.horizontal).padding(.top, 8)
     }
 
     private var centerTransport: some View {
-        HStack(spacing: 44) {
-            // Skip back 10s (hidden for live — no fixed timeline to seek within).
-            if !isLive {
-                seekButton("gobackward.10", by: -10)
-            }
-            Button { coordinator.player?.togglePause(); scheduleHide() } label: {
-                Image(systemName: isPaused ? "play.fill" : "pause.fill")
-                    .font(.system(size: 50)).foregroundStyle(.white).shadow(radius: 8)
-                    .frame(width: 100, height: 100)
-            }
-            .accessibilityLabel(isPaused ? "Play" : "Pause")
-            if !isLive {
-                seekButton("goforward.10", by: 10)
+        GlassEffectContainer(spacing: 36) {
+            HStack(spacing: 36) {
+                // Skip back 10s (hidden for live — no fixed timeline to seek within).
+                if !isLive {
+                    seekButton("gobackward.10", by: -10)
+                }
+                Button { coordinator.player?.togglePause(); scheduleHide() } label: {
+                    Group {
+                        if buffering || reconnecting {
+                            ProgressView().controlSize(.large).tint(.white)
+                        } else {
+                            Image(systemName: isPaused ? "play.fill" : "pause.fill")
+                                .font(.system(size: 36, weight: .semibold))
+                                .contentTransition(.symbolEffect(.replace))
+                        }
+                    }
+                    .frame(width: 84, height: 84)
+                }
+                .buttonStyle(.glassProminent)
+                .buttonBorderShape(.circle)
+                .tint(Theme.Palette.accent)
+                .accessibilityLabel(isPaused ? "Play" : "Pause")
+                if !isLive {
+                    seekButton("goforward.10", by: 10)
+                }
             }
         }
     }
@@ -869,9 +886,11 @@ struct PlayerScreen: View {
             if duration > 0 { onSeek(target, duration); lastReported = target }
             scheduleHide()
         } label: {
-            Image(systemName: icon).font(.system(size: 30, weight: .semibold))
-                .foregroundStyle(.white).shadow(radius: 4).frame(width: 60, height: 60)
+            Image(systemName: icon).font(.system(size: 24, weight: .semibold))
+                .foregroundStyle(.white).frame(width: 60, height: 60)
         }
+        .buttonStyle(.glass)
+        .buttonBorderShape(.circle)
         .accessibilityLabel(delta < 0 ? "Skip back 10 seconds" : "Skip forward 10 seconds")
     }
 
@@ -882,48 +901,70 @@ struct PlayerScreen: View {
                 // indicator. The user pauses/resumes; there's nothing to seek to.
                 liveIndicator
             } else {
-                HStack(spacing: 12) {
-                    Text(timeString(currentTime)).font(.caption.monospacedDigit()).foregroundStyle(.white)
-                    // While dragging, the thumb follows a local scrubTarget so an incoming timePos tick
-                    // can't yank it back to the (pre-seek) playback position (#32). On release we commit
-                    // scrubTarget once. Outside a drag the thumb tracks live currentTime.
-                    Slider(value: Binding(get: { scrubbing ? scrubTarget : currentTime },
-                                          set: { scrubTarget = $0 }),
-                           in: 0...max(duration, 1)) { editing in
-                        scrubbing = editing
-                        if editing { scrubTarget = currentTime; hideTask?.cancel() }
-                        else {
-                            currentTime = scrubTarget
-                            coordinator.player?.seek(to: scrubTarget)
-                            if duration > 0 { onSeek(scrubTarget, duration); lastReported = scrubTarget }
-                            scheduleHide()
-                        }
-                    }.tint(Theme.Palette.accent)
-                    Text(timeString(duration)).font(.caption.monospacedDigit()).foregroundStyle(.white)
+                // While dragging, the thumb follows a local scrubTarget so an incoming timePos tick
+                // can't yank it back to the (pre-seek) playback position (#32). On release we commit
+                // scrubTarget once. Outside a drag the thumb tracks live currentTime.
+                Slider(value: Binding(get: { scrubbing ? scrubTarget : currentTime },
+                                      set: { scrubTarget = $0 }),
+                       in: 0...max(duration, 1)) {
+                    Text("Playback position")
+                } minimumValueLabel: {
+                    Text(timeString(scrubbing ? scrubTarget : currentTime))
+                        .font(.caption.monospacedDigit()).foregroundStyle(.white)
+                } maximumValueLabel: {
+                    Text("−" + timeString(max(duration - (scrubbing ? scrubTarget : currentTime), 0)))
+                        .font(.caption.monospacedDigit()).foregroundStyle(.white.opacity(0.8))
+                } onEditingChanged: { editing in
+                    scrubbing = editing
+                    if editing { scrubTarget = currentTime; hideTask?.cancel() }
+                    else {
+                        currentTime = scrubTarget
+                        coordinator.player?.seek(to: scrubTarget)
+                        if duration > 0 { onSeek(scrubTarget, duration); lastReported = scrubTarget }
+                        scheduleHide()
+                    }
                 }
+                .tint(Theme.Palette.accent)
+                .accessibilityValue("\(timeString(currentTime)) of \(timeString(duration))")
+                .padding(.horizontal, 16).padding(.vertical, 10)
+                .glassEffect(.regular, in: .capsule)
             }
 
-            HStack(spacing: 0) {
-                controlButton("speedometer", speed == 1.0 ? "Speed" : speedLabel(speed)) { openPanel(.speed) }
-                Spacer()
-                controlButton("captions.bubble", "Subtitles") { openPanel(.subtitles) }
-                if !audioTracks.isEmpty {   // parity with tvOS: open the Audio panel for ANY track, not only when >1
-                    Spacer()
-                    controlButton("waveform", "Audio") { openPanel(.audio) }
-                }
-                Spacer()
-                controlButton("aspectratio", "Aspect") { openPanel(.video) }
-                if hasAlternateSources {
-                    Spacer()
-                    controlButton("rectangle.stack", "Sources") { openPanel(.sources) }
+            // Icon-only glass buttons (each with an accessibility label) instead of icon + text links.
+            GlassEffectContainer(spacing: 12) {
+                HStack(spacing: 12) {
+                    speedButton
+                    iconButton("captions.bubble", label: "Subtitles") { openPanel(.subtitles) }
+                    if !audioTracks.isEmpty {   // parity with tvOS: open the Audio panel for ANY track, not only when >1
+                        iconButton("waveform", label: "Audio") { openPanel(.audio) }
+                    }
+                    iconButton("aspectratio", label: "Aspect ratio") { openPanel(.video) }
+                    if hasAlternateSources {
+                        iconButton("rectangle.stack", label: "Sources") { openPanel(.sources) }
+                    }
                 }
             }
-            .padding(.horizontal, 8)
         }
         .padding(.horizontal).padding(.bottom, 22)
     }
 
-    /// The Live position indicator shown in place of the scrubber: a pulsing red dot + "LIVE", and a
+    /// Speed opens its panel; the button shows the speed once it's not 1×.
+    private var speedButton: some View {
+        Button { openPanel(.speed) } label: {
+            if speed == 1.0 {
+                glassIcon("gauge.with.dots.needle.67percent")
+            } else {
+                Text(speedLabel(speed)).font(.subheadline.weight(.semibold).monospacedDigit())
+                    .frame(width: 44, height: 44)
+            }
+        }
+        .buttonStyle(.glass)
+        .buttonBorderShape(.circle)
+        .accessibilityLabel("Playback speed")
+        .accessibilityValue(speedLabel(speed))
+    }
+
+    /// The Live position indicator shown in place of the scrubber: a red dot + "LIVE", and a
     /// running elapsed timer so the user can still see playback is advancing.
     private var liveIndicator: some View {
         HStack(spacing: 10) {
@@ -931,8 +972,8 @@ struct PlayerScreen: View {
                 Circle().fill(.red).frame(width: 9, height: 9)
                 Text("LIVE").font(.caption.weight(.heavy)).foregroundStyle(.white).tracking(1)
             }
-            .padding(.horizontal, 11).padding(.vertical, 6)
-            .background(.black.opacity(0.4), in: Capsule())
+            .padding(.horizontal, 12).padding(.vertical, 7)
+            .glassEffect(.regular, in: .capsule)
             Spacer()
             if currentTime > 0 {
                 Text(timeString(currentTime)).font(.caption.monospacedDigit()).foregroundStyle(.white.opacity(0.85))
@@ -940,23 +981,17 @@ struct PlayerScreen: View {
         }
     }
 
-    private func controlButton(_ icon: String, _ title: String, action: @escaping () -> Void) -> some View {
-        Button(action: action) {
-            HStack(spacing: 7) {
-                Image(systemName: icon).font(.system(size: 15, weight: .semibold))
-                Text(title).font(.subheadline.weight(.medium))
-            }
-            .foregroundStyle(.white)
-        }
+    /// A 44pt symbol sized for the circular glass chrome buttons (min 44pt tap target, #30).
+    private func glassIcon(_ systemName: String) -> some View {
+        Image(systemName: systemName).font(.system(size: 17, weight: .semibold))
+            .frame(width: 44, height: 44)
     }
 
     private func iconButton(_ systemName: String, label: String, action: @escaping () -> Void) -> some View {
-        Button(action: action) {
-            Image(systemName: systemName).font(.system(size: 17, weight: .semibold))
-                .foregroundStyle(.white).padding(11).background(.black.opacity(0.35), in: Circle())
-                .frame(width: 44, height: 44).contentShape(Circle())   // min 44pt tap target (#30)
-        }
-        .accessibilityLabel(label)
+        Button(action: action) { glassIcon(systemName) }
+            .buttonStyle(.glass)
+            .buttonBorderShape(.circle)
+            .accessibilityLabel(label)
     }
 
     // MARK: - Skip intro / outro
@@ -971,14 +1006,12 @@ struct PlayerScreen: View {
                     currentTime = segment.end
                     updateCurrentSkip(at: segment.end)
                 } label: {
-                    HStack(spacing: 8) {
-                        Image(systemName: "forward.fill")
-                        Text(segment.label).fontWeight(.semibold)
-                    }
-                    .padding(.horizontal, 22).padding(.vertical, 12)
-                    .foregroundStyle(Theme.Palette.onAccent)
-                    .background(Capsule().fill(Theme.Palette.accent))
+                    Label(segment.label, systemImage: "forward.fill")
+                        .fontWeight(.semibold)
+                        .padding(.horizontal, 10).padding(.vertical, 6)
                 }
+                .buttonStyle(.glassProminent)
+                .tint(Theme.Palette.accent)
                 .padding(.trailing, 28).padding(.bottom, 40)
             }
         }
@@ -1042,12 +1075,10 @@ struct PlayerScreen: View {
                 HStack {
                     Text(p.title).font(.headline).foregroundStyle(.white)
                     Spacer()
-                    Button { close() } label: {
-                        Image(systemName: "xmark").font(.system(size: 13, weight: .bold))
-                            .foregroundStyle(.white.opacity(0.7)).padding(7).background(.white.opacity(0.12), in: Circle())
-                            .frame(width: 44, height: 44).contentShape(Circle())   // min 44pt tap target (#30)
-                    }
-                    .accessibilityLabel("Close panel")
+                    Button { close() } label: { glassIcon("xmark") }
+                        .buttonStyle(.glass)
+                        .buttonBorderShape(.circle)
+                        .accessibilityLabel("Close panel")
                 }
                 .padding(.horizontal).padding(.vertical, 14)
                 Divider().overlay(.white.opacity(0.15))
@@ -1060,8 +1091,8 @@ struct PlayerScreen: View {
                 }
                 .frame(maxHeight: 360)
             }
-            .background(Theme.Palette.surface1)
-            .clipShape(RoundedRectangle(cornerRadius: 18))
+            // Dark-tinted glass so the white rows stay readable over a bright frame.
+            .glassEffect(.regular.tint(.black.opacity(0.45)), in: .rect(cornerRadius: 28))
             .frame(maxWidth: 560)
             .padding()
             .tint(Theme.Palette.accent)
@@ -1164,7 +1195,23 @@ struct PlayerScreen: View {
             return stats.map { Row(label: $0.0, detail: $0.1) }
         case .playerSettings:
             let hw = coordinator.player?.hardwareDecoding ?? true
-            return [
+            var rs: [Row] = []
+            if !isLive {
+                // Restart from 0:00 (tvOS parity #5): seek to the start and keep playing.
+                rs.append(Row(label: "Restart from Beginning") {
+                    close()
+                    coordinator.player?.seek(to: 0)
+                    currentTime = 0
+                    if duration > 0 { onSeek(0, duration); lastReported = 0 }
+                    if isPaused { coordinator.player?.togglePause() }   // restart implies resume
+                })
+            }
+            rs.append(Row(label: "Play in Another App", detail: "›") {   // hand off to Infuse / VLC / Share
+                close()
+                hideTask?.cancel()
+                showExternalChooser = true
+            })
+            return rs + [
                 Row(label: "Decoder", isHeader: true),
                 Row(label: "Hardware", detail: "recommended", selected: hw) {
                     coordinator.player?.setHardwareDecoding(true)
@@ -1332,9 +1379,14 @@ struct PlayerScreen: View {
     /// fresh deadline" approach, fixing the unreliable show/hide.
     private func toggleControls() {
         if panel != nil { return }   // a tap behind an open panel shouldn't flip the bar; the scrim handles dismissal
+        // A quick follow-up tap meant for a button can land on the video while the controls are still
+        // transitioning in; don't let it hide them again.
+        if controlsVisible, Date().timeIntervalSince(controlsShownAt) < 0.5 { return }
         withAnimation(.easeInOut(duration: 0.2)) { controlsVisible.toggle() }
+        if controlsVisible { controlsShownAt = Date() }
         if controlsVisible { scheduleHide() } else { hideTask?.cancel() }
     }
+
     private func scheduleHide() {
         hideTask?.cancel()
         controlsVisible = true
@@ -1343,7 +1395,8 @@ struct PlayerScreen: View {
             // Never auto-hide before the first frame arrives: a stuck pre-start load must KEEP its
             // controls (and their close button) on screen so the player is never a trap. Also hold
             // while scrubbing, a panel is open, or paused.
-            guard !Task.isCancelled, hasStartedPlaying, !scrubbing, panel == nil, !isPaused else { return }
+            guard !Task.isCancelled, hasStartedPlaying, !scrubbing, panel == nil, !isPaused,
+                  !voiceOverEnabled else { return }
             withAnimation(.easeInOut(duration: 0.2)) { controlsVisible = false }
         }
     }

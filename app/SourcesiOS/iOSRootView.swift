@@ -733,7 +733,6 @@ extension View {
                 },
                 onClose: { launch.wrappedValue = nil }
             )
-            .ignoresSafeArea()
         }
     }
 }
@@ -968,8 +967,7 @@ private struct PosterGrid: View {
     /// The grid stays generic; the caller decides whether and what to load next. nil = no pagination.
     var onReachEnd: (() -> Void)? = nil
     @EnvironmentObject private var theme: ThemeManager   // observe textScale so Theme.Typography repaints live
-    // Center the adaptive tracks so the cards distribute evenly across the available width instead of
-    // packing to the leading edge. Min track matches the 120pt card + a little breathing room.
+    // Cards accept the adaptive track width, including tracks narrower than the rail cards.
     private let columns = [GridItem(.adaptive(minimum: 116), spacing: Theme.Space.sm, alignment: .center)]
     var body: some View {
         LazyVGrid(columns: columns, alignment: .center, spacing: Theme.Space.md) {
@@ -1011,6 +1009,7 @@ private struct PosterRail: View {
                         Button { onTap(item) } label: {
                             PosterCardiOS(id: item.id, name: item.name, poster: item.poster,
                                           progress: item.progress, menu: menu)
+                                .frame(width: 120)
                         }
                         .buttonStyle(.plain)
                         .accessibilityElement(children: .ignore)
@@ -1043,30 +1042,38 @@ private struct PosterCardiOS: View {
 
     private var card: some View {
         VStack(alignment: .leading, spacing: 6) {
-            ZStack(alignment: .bottom) {
-                AsyncImage(url: URL(string: poster ?? "")) { phase in
-                    switch phase {
-                    case .success(let img): img.resizable().aspectRatio(2/3, contentMode: .fill)
-                    default: Theme.Palette.surface1
-                    }
-                }
-                .frame(width: 120, height: 180)
-                .clipShape(RoundedRectangle(cornerRadius: Theme.Radius.card, style: .continuous))
-                if progress > 0.01 {
-                    GeometryReader { geo in
-                        ZStack(alignment: .leading) {
-                            Rectangle().fill(.black.opacity(0.4))
-                            Rectangle().fill(Theme.Palette.accent).frame(width: geo.size.width * progress)
+            // The placeholder defines the poster size before artwork loads, so the image's
+            // intrinsic dimensions cannot expand a grid cell or change its aspect ratio.
+            Theme.Palette.surface1
+                .aspectRatio(2.0 / 3.0, contentMode: .fit)
+                .overlay {
+                    GeometryReader { geometry in
+                        AsyncImage(url: URL(string: poster ?? "")) { phase in
+                            if case .success(let image) = phase {
+                                image.resizable().scaledToFill()
+                                    .frame(width: geometry.size.width, height: geometry.size.height)
+                            }
                         }
                     }
-                    .frame(height: 4)
                 }
-            }
-            .frame(width: 120, height: 180)
+                .overlay(alignment: .bottom) {
+                    if progress > 0.01 {
+                        GeometryReader { geometry in
+                            ZStack(alignment: .leading) {
+                                Rectangle().fill(.black.opacity(0.4))
+                                Rectangle().fill(Theme.Palette.accent)
+                                    .frame(width: geometry.size.width * min(max(progress, 0), 1))
+                            }
+                        }
+                        .frame(height: 4)
+                    }
+                }
+                .clipShape(RoundedRectangle(cornerRadius: Theme.Radius.card, style: .continuous))
             Text(name)
                 .font(Theme.Typography.label)
                 .foregroundStyle(Theme.Palette.textSecondary)
-                .lineLimit(1).frame(width: 120, alignment: .leading)
+                .lineLimit(1)
+                .frame(minWidth: 0, maxWidth: .infinity, alignment: .leading)
         }
     }
 }
